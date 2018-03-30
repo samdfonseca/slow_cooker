@@ -1,3 +1,5 @@
+[![CircleCI](https://circleci.com/gh/BuoyantIO/slow_cooker.svg?style=shield)](https://circleci.com/gh/BuoyantIO/slow_cooker)
+
 # slow_cooker
 A load tester for tenderizing your servers.
 
@@ -15,45 +17,31 @@ or:
 
 `go run main.go <url>`
 
+# Testing
+
+`go test ./...`
+
 # Flags
 
-`-qps <int>`
-
-Queries per second to send to a backend.
-
-`-concurrency <int>`
-
-How many goroutines to run, each at the specified qps level. Measure
-total qps as `qps * concurrency`.
-
-`-host <string>`
-
-Set a `Host:` header.
-
-`-interval 10s`
-
-How often to report to stdout.
-
-`-noreuse`
-
-Do not reuse connections. (Connection reuse is the default.)
-
-`-compress`
-
-Ask for compressed responses.
-
-`-noLatencySummary`
-
-Don't print the latency histogram report at the end.
-
-`-reportLatenciesCSV <filename>`
-
-Writes a CSV file of latencies. Format is: milliseconds to number of
-requests that fall into that bucket.
-
-`-totalRequests <int>`
-
-Exit after sending this many requests.
+| Flag                  | Default   | Description |
+|-----------------------|-----------|-------------|
+| `-qps`                | 1         | QPS to send to backends per request thread. |
+| `-concurrency`        | 1         | Number of goroutines to run, each at the specified QPS level. Measure total QPS as `qps * concurrency`. |
+| `-compress`           | `<unset>` | If set, ask for compressed responses. |
+| `-data`               | `<none>`  | Include the specified body data in requests. If the data starts with a '@' the remaining value will be treated as a file path to read the body data from, or if the data value is '@-', the body data will be read from stdin. |
+| `-hashSampleRate`     | `0.0`     | Sampe Rate for checking request body's hash. Interval in the range of [0.0, 1.0] |
+| `-hashValue`          | `<none>`  | fnv-1a hash value to check the request body against |
+| `-header`             | `<none>`  | Adds additional headers to each request. Can be specified multiple times. Format is `key: value`. |
+| `-host`               | `<none>`  | Overrides the default host header value that's set on each request. |
+| `-interval`           | 10s       | How often to report stats to stdout. |
+| `-method`             | GET       | Determines which HTTP method to use when making the request. |
+| `-metric-addr`        | `<none>`  | Address to use when serving the Prometheus `/metrics` endpoint. No metrics are served if unset. Format is `host:port` or `:port`. |
+| `-noLatencySummary`   | `<unset>` | If set, don't print the latency histogram report at the end. |
+| `-noreuse`            | `<unset>` | If set, do not reuse connections. Default is to reuse connections. |
+| `-reportLatenciesCSV` | `<none>`  | Filename to write CSV latency values. Format of CSV is millisecond buckets with number of requests in each bucket. |
+| `-timeout`            | 10s       | Individual request timeout. |
+| `-totalRequests`      | `<none>`  | Exit after sending this many requests. |
+| `-help`               | `<unset>` | If set, print all available flags and exit. |
 
 # Using multiple Host headers
 
@@ -119,11 +107,14 @@ slowdowns. If you're running multi-hour tests, bumping up the reporting
 interval to 60 seconds (`60s` or `1m`) is recommended.
 
 ```
-$timestamp $good/$bad/$failed $trafficGoal $percentGood $interval $min [$p50 $p95 $p99 $p999] $max
+$timestamp $good/$bad/$failed $trafficGoal $percentGoal $interval $min [$p50 $p95 $p99 $p999] $max $bhash
 ```
 
-`bad` means a status code in the 500 range. `failed` means a
-connection failure.
+`bad` means a status code in the 500 range. `failed` means a connection failure.
+`percentGoal` is calculated as the total number of `good` and `bad` requests as
+a percentage of `trafficGoal`.
+
+`bhash` is the number of failed hashes of body content. A value greater than 0 indicates a real problem.
 
 ## Tips and tricks
 
@@ -132,7 +123,7 @@ connection failure.
 Use `tee` to keep a logfile of slow_cooker results and `cut` to find bad or failed requests.
 
 ```bash
-./slow_cooker_linux_amd64 -qps 5 -concurrency 20 -interval 10s -reuse http://localhost:4140 | tee slow_cooker.log
+./slow_cooker_linux_amd64 -qps 5 -concurrency 20 -interval 10s http://localhost:4140 | tee slow_cooker.log
 ```
 
 ### use cut to look at specific fields from your tee'd logfile
