@@ -5,11 +5,14 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"io"
 	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -24,12 +27,14 @@ import (
 	"time"
 
 	"github.com/codahale/hdrhistogram"
-	gopherJson "github.com/layeh/gopher-json"
+	gopherJson "layeh.com/gopher-json"
 	"github.com/samdfonseca/slow_cooker/hdrreport"
 	"github.com/samdfonseca/slow_cooker/ring"
 	"github.com/samdfonseca/slow_cooker/scripting"
 	"github.com/samdfonseca/slow_cooker/window"
 	"github.com/yuin/gopher-lua"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // DayInMs 1 day in milliseconds
@@ -38,11 +43,12 @@ const DayInMs int64 = 24 * 60 * 60 * 1000000
 // MeasuredResponse holds metadata about the response
 // we receive from the server under test.
 type MeasuredResponse struct {
-	sz      uint64
-	code    int
-	latency int64
-	timeout bool
-	err     error
+	sz              uint64
+	code            int
+	latency         int64
+	timeout         bool
+	failedHashCheck bool
+	err             error
 }
 
 func newClient(
@@ -50,17 +56,25 @@ func newClient(
 	https bool,
 	noreuse bool,
 	maxConn int,
+	timeout time.Duration,
 ) *http.Client {
 	tr := http.Transport{
 		DisableCompression:  !compress,
 		DisableKeepAlives:   noreuse,
 		MaxIdleConnsPerHost: maxConn,
 		Proxy:               http.ProxyFromEnvironment,
+		Dial: (&net.Dialer{
+			Timeout: 5 * time.Second,
+		}).Dial,
+		TLSHandshakeTimeout: 5 * time.Second,
 	}
 	if https {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	}
-	return &http.Client{Transport: &tr}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: &tr,
+	}
 }
 
 func sendRequest(
@@ -68,12 +82,18 @@ func sendRequest(
 	method string,
 	url *url.URL,
 	host string,
+	headers headerSet,
 	reqID uint64,
 	reqBodyBuffer []byte,
+	noreuse bool,
+	hashValue uint64,
+	checkHash bool,
+	hasher hash.Hash64,
 	received chan *MeasuredResponse,
 	bodyBuffer []byte,
 ) {
 	req, err := http.NewRequest(method, url.String(), bytes.NewBuffer(reqBodyBuffer))
+	req.Close = noreuse
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err.Error())
 		fmt.Fprintf(os.Stderr, "\n")
@@ -82,6 +102,9 @@ func sendRequest(
 		req.Host = host
 	}
 	req.Header.Add("Sc-Req-Id", strconv.FormatUint(reqID, 10))
+	for k, v := range headers {
+		req.Header.Add(k, v)
+	}
 
 	var elapsed time.Duration
 	start := time.Now()
@@ -96,18 +119,35 @@ func sendRequest(
 	response, err := client.Do(req)
 
 	if err != nil {
-		received <- &MeasuredResponse{0, 0, 0, false, err}
+		received <- &MeasuredResponse{err: err}
 	} else {
-		if sz, err := io.CopyBuffer(ioutil.Discard, response.Body, bodyBuffer); err == nil {
-			response.Body.Close()
-			received <- &MeasuredResponse{
-				uint64(sz),
-				response.StatusCode,
-				elapsed.Nanoseconds() / 1000000,
-				false,
-				nil}
+		defer response.Body.Close()
+		if !checkHash {
+			if sz, err := io.CopyBuffer(ioutil.Discard, response.Body, bodyBuffer); err == nil {
+
+				received <- &MeasuredResponse{
+					sz:      uint64(sz),
+					code:    response.StatusCode,
+					latency: elapsed.Nanoseconds() / 1000000}
+			} else {
+				received <- &MeasuredResponse{err: err}
+			}
 		} else {
-			received <- &MeasuredResponse{0, 0, 0, false, err}
+			if bytes, err := ioutil.ReadAll(response.Body); err != nil {
+				received <- &MeasuredResponse{err: err}
+			} else {
+				hasher.Write(bytes)
+				sum := hasher.Sum64()
+				failedHashCheck := false
+				if hashValue != sum {
+					failedHashCheck = true
+				}
+				received <- &MeasuredResponse{
+					sz:              uint64(len(bytes)),
+					code:            response.StatusCode,
+					latency:         elapsed.Nanoseconds() / 1000000,
+					failedHashCheck: failedHashCheck}
+			}
 		}
 	}
 }
@@ -135,6 +175,84 @@ func finishSendingTraffic() {
 	shouldFinishLock.Unlock()
 }
 
+type headerSet map[string]string
+
+func (h *headerSet) String() string {
+	return ""
+}
+
+func (h *headerSet) Set(s string) error {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) < 2 || len(parts[0]) == 0 {
+		return fmt.Errorf("Header invalid")
+	}
+	name := strings.TrimSpace(parts[0])
+	value := strings.TrimSpace(parts[1])
+	(*h)[name] = value
+	return nil
+}
+
+func loadData(data string) []byte {
+	var file *os.File
+	var requestData []byte
+	var err error
+	if strings.HasPrefix(data, "@") {
+		path := data[1:]
+		if path == "-" {
+			file = os.Stdin
+		} else {
+			file, err = os.Open(path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, err.Error())
+				os.Exit(1)
+			}
+			defer file.Close()
+		}
+
+		requestData, err = ioutil.ReadAll(file)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+	} else {
+		requestData = []byte(data)
+	}
+
+	return requestData
+}
+
+var (
+	promRequests = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "requests",
+		Help: "Number of requests",
+	})
+
+	promSuccesses = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "successes",
+		Help: "Number of successful requests",
+	})
+
+	promLatencyHistogram = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "latency_ms",
+		Help: "RPC latency distributions in milliseconds.",
+		// 50 exponential buckets ranging from 0.5 ms to 3 minutes
+		// TODO: make this tunable
+		Buckets: prometheus.ExponentialBuckets(0.5, 1.3, 50),
+	})
+)
+
+func registerMetrics() {
+	prometheus.MustRegister(promRequests)
+	prometheus.MustRegister(promSuccesses)
+	prometheus.MustRegister(promLatencyHistogram)
+}
+
+// Sample Rate is between [0.0, 1.0] and determines what percentage of request bodies
+// should be checked that their hash matches a known hash.
+func shouldCheckHash(sampleRate float64) bool {
+	return rand.Float64() < sampleRate
+}
+
 func main() {
 	qps := flag.Int("qps", 1, "QPS to send to backends per request thread")
 	concurrency := flag.Int("concurrency", 1, "Number of request threads")
@@ -144,11 +262,17 @@ func main() {
 	interval := flag.Duration("interval", 10*time.Second, "reporting interval")
 	noreuse := flag.Bool("noreuse", false, "don't reuse connections")
 	compress := flag.Bool("compress", false, "use compression")
+	clientTimeout := flag.Duration("timeout", 10*time.Second, "individual request timeout")
 	noLatencySummary := flag.Bool("noLatencySummary", false, "suppress the final latency summary")
 	reportLatenciesCSV := flag.String("reportLatenciesCSV", "",
 		"filename to output hdrhistogram latencies in CSV")
 	help := flag.Bool("help", false, "show help message")
 	totalRequests := flag.Uint64("totalRequests", 0, "total number of requests to send before exiting")
+	headers := make(headerSet)
+	flag.Var(&headers, "header", "HTTP request header. (can be repeated.)")
+	metricAddr := flag.String("metric-addr", "", "address to serve metrics on")
+	hashValue := flag.Uint64("hashValue", 0, "fnv-1a hash value to check the request body against")
+	hashSampleRate := flag.Float64("hashSampleRate", 0.0, "Sampe Rate for checking request body's hash. Interval in the range of [0.0, 1.0]")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s <url> [flags]\n", path.Base(os.Args[0]))
@@ -204,6 +328,7 @@ func main() {
 	failed := uint64(0)
 	min := int64(math.MaxInt64)
 	max := int64(0)
+	failedHashCheck := int64(0)
 
 	hist := hdrhistogram.New(0, DayInMs, 3)
 	globalHist := hdrhistogram.New(0, DayInMs, 3)
@@ -215,7 +340,7 @@ func main() {
 	totalTrafficTarget = *qps * *concurrency * int(interval.Seconds())
 
 	doTLS := dstURL.Scheme == "https"
-	client := newClient(*compress, doTLS, *noreuse, *concurrency)
+	client := newClient(*compress, doTLS, *noreuse, *concurrency, *clientTimeout)
 	var sendTraffic sync.WaitGroup
 	// The time portion of the header can change due to timezone.
 	timeLen := len(time.Now().Format(time.RFC3339))
@@ -224,7 +349,7 @@ func main() {
 	intPadding := strings.Repeat(" ", intLen-2)
 
 	fmt.Printf("# sending %d %s req/s with concurrency=%d to %s ...\n", (*qps * *concurrency), *method, *concurrency, dstURL)
-	fmt.Printf("# %s good/b/f t   good%% %s min [p50 p95 p99  p999]  max change\n", timePadding, intPadding)
+	fmt.Printf("# %s good/b/f t   goal%% %s min [p50 p95 p99  p999]  max bhash change\n", timePadding, intPadding)
 	for i := 0; i < *concurrency; i++ {
 		ticker := time.NewTicker(timeToWait)
 		go func() {
@@ -232,13 +357,20 @@ func main() {
 			bodyBuffer := make([]byte, 50000)
 			sendTraffic.Add(1)
 			for _ = range ticker.C {
+				var checkHash bool
+				hasher := fnv.New64a()
+				if *hashSampleRate > 0.0 {
+					checkHash = shouldCheckHash(*hashSampleRate)
+				} else {
+					checkHash = false
+				}
 				shouldFinishLock.RLock()
 				if !shouldFinish {
 					reqHost := hosts[rand.Intn(len(hosts))]
 					reqID := atomic.AddUint64(&reqID, 1)
 					reqBodyBuffer := dataGenerator(*method, dstURL, reqHost, reqID)
 					shouldFinishLock.RUnlock()
-					sendRequest(client, *method, dstURL, reqHost, reqID, reqBodyBuffer, received, bodyBuffer)
+					sendRequest(client, *method, dstURL, hosts[rand.Intn(len(hosts))], headers, atomic.AddUint64(&reqID, 1), reqBodyBuffer, *noreuse, *hashValue, checkHash, hasher, received, bodyBuffer)
 				} else {
 					shouldFinishLock.RUnlock()
 					sendTraffic.Done()
@@ -251,6 +383,14 @@ func main() {
 	cleanup := make(chan bool, 2)
 	interrupted := make(chan os.Signal, 2)
 	signal.Notify(interrupted, syscall.SIGINT)
+
+	if *metricAddr != "" {
+		registerMetrics()
+		go func() {
+			http.Handle("/metrics", promhttp.Handler())
+			http.ListenAndServe(*metricAddr, nil)
+		}()
+	}
 
 	for {
 		select {
@@ -281,7 +421,7 @@ func main() {
 				min = 0
 			}
 			// Periodically print stats about the request load.
-			percentAchieved := int(math.Min(((float64(good) /
+			percentAchieved := int(math.Min((((float64(good) + float64(bad)) /
 				float64(totalTrafficTarget)) * 100), 100))
 
 			lastP99 := int(hist.ValueAtQuantile(99))
@@ -292,7 +432,7 @@ func main() {
 			changeIndicator := window.CalculateChangeIndicator(latencyHistory.Items, lastP99)
 			latencyHistory.Push(lastP99)
 
-			fmt.Printf("%s %6d/%1d/%1d %d %3d%% %s %3d [%3d %3d %3d %4d ] %4d %s\n",
+			fmt.Printf("%s %6d/%1d/%1d %d %3d%% %s %3d [%3d %3d %3d %4d ] %4d %6d %s\n",
 				t.Format(time.RFC3339),
 				good,
 				bad,
@@ -306,6 +446,7 @@ func main() {
 				hist.ValueAtQuantile(99),
 				hist.ValueAtQuantile(999),
 				max,
+				failedHashCheck,
 				changeIndicator)
 
 			count = 0
@@ -315,6 +456,7 @@ func main() {
 			min = math.MaxInt64
 			max = 0
 			failed = 0
+			failedHashCheck = 0
 			hist.Reset()
 			timeout = time.After(*interval)
 
@@ -323,13 +465,19 @@ func main() {
 			}
 		case managedResp := <-received:
 			count++
+			promRequests.Inc()
 			if managedResp.err != nil {
 				fmt.Fprintln(os.Stderr, managedResp.err)
 				failed++
 			} else {
 				size += managedResp.sz
+				if managedResp.failedHashCheck {
+					failedHashCheck++
+				}
 				if managedResp.code >= 200 && managedResp.code < 500 {
 					good++
+					promSuccesses.Inc()
+					promLatencyHistogram.Observe(float64(managedResp.latency))
 				} else {
 					bad++
 				}

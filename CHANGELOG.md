@@ -3,6 +3,26 @@
 All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](http://semver.org/).
 
+## Next release
+### Added
+- Users can now check request bodies against an fnv-1a hash value with a configurable sample rate.
+### Changed
+- Renamed `good%` column to `goal%`, and started counting bad requests toward goal.
+
+## [1.1.0] - 2017-01-26
+### Added
+- Added Prometheus `/metrics` endpoint, using new `metric-addr` param
+
+## [1.0.1] - 2017-01-11
+### Added
+- Added basic CONTRIBUTORS file to help guide PRs
+- Added flag to set HTTP request body payload
+- Added flag to set HTTP request headers
+- Added flag to set HTTP method used for requests
+
+### Changed
+- Modified Dockerfile to build project from fully-qualified package location
+
 ## [1.0.0] - 2016-12-8
 ### Added
 - Added percent success to the output.
